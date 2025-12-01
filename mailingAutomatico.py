@@ -14,6 +14,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     ElementClickInterceptedException,
     StaleElementReferenceException,
+    TimeoutException,
 )
 
 
@@ -169,8 +170,7 @@ telefones AS (
     JOIN fones_tb tel
         ON tel.cod_cad = cad.cod_cad
     LEFT JOIN rec_comp_tb recc
-        ON recc.nmcont = cad.nmcont
-       AND cad.cod_cli = recc.cod_cli
+        ON recc.nmcont = cad.nmcont AND cad.cod_cli = recc.cod_cli
     WHERE cad.cod_cli IN ({cod_cli})
       AND tel.obs NOT LIKE '%Desconhecido%'
       AND tel.obs NOT LIKE '%incorreto%'
@@ -337,8 +337,7 @@ telefones AS (
     FROM cadastros_tb cad
     JOIN fones_tb tel ON tel.cod_cad = cad.cod_cad
     LEFT JOIN rec_comp_tb recc
-        ON recc.nmcont = cad.nmcont
-       AND cad.cod_cli = recc.cod_cli
+        ON recc.nmcont = cad.nmcont AND cad.cod_cli = recc.cod_cli
     WHERE cad.cod_cli IN ({cod_cli})
       AND tel.obs NOT LIKE '%Desconhecido%'
       AND tel.obs NOT LIKE '%incorreto%'
@@ -503,8 +502,7 @@ telefones AS (
     FROM cadastros_tb cad
     JOIN fones_tb tel ON tel.cod_cad = cad.cod_cad
     LEFT JOIN rec_comp_tb recc
-        ON recc.nmcont = cad.nmcont
-       AND cad.cod_cli = recc.cod_cli
+        ON recc.nmcont = cad.nmcont AND cad.cod_cli = recc.cod_cli
     WHERE cad.cod_cli IN ({cod_cli})
       AND cad.cod_cad NOT IN(
             SELECT h.cod_cli
@@ -643,7 +641,50 @@ def salvar_csv(mailing_id, colunas, rows):
     return caminho
 
 
+def _encontrar_campo_usuario(driver, wait):
+    """Tenta localizar o campo de usuário por vários seletores mais específicos."""
+    xpaths = [
+        # IDs/comuns
+        "//input[@type='text' and (@id='txtLogin' or @name='txtLogin')]",
+        "//input[@type='text' and (contains(@id,'login') or contains(@name,'login'))]",
+        # placeholder com 'Usuário' ou 'Login'
+        "//input[@type='text' and (contains(translate(@placeholder,'USUARIOLOGIN','usuariologin'),'usuario') "
+        "or contains(translate(@placeholder,'USUARIOLOGIN','usuariologin'),'login'))]",
+        # fallback mais genérico, mas ainda clicável
+        "//input[@type='text' or @type='email']",
+    ]
+
+    for xp in xpaths:
+        try:
+            elem = wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
+            if elem:
+                return elem
+        except TimeoutException:
+            continue
+    raise TimeoutException("Não foi possível localizar o campo de usuário na tela de login da OLOS.")
+
+
+def _encontrar_campo_senha(driver, wait):
+    """Tenta localizar o campo de senha por vários seletores mais específicos."""
+    xpaths = [
+        "//input[@type='password' and (@id='txtSenha' or @name='txtSenha')]",
+        "//input[@type='password' and (contains(@id,'senha') or contains(@name,'senha'))]",
+        "//input[@type='password' and contains(translate(@placeholder,'SENHA','senha'),'senha')]",
+        "//input[@type='password']",
+    ]
+
+    for xp in xpaths:
+        try:
+            elem = wait.until(EC.element_to_be_clickable((By.XPATH, xp)))
+            if elem:
+                return elem
+        except TimeoutException:
+            continue
+    raise TimeoutException("Não foi possível localizar o campo de senha na tela de login da OLOS.")
+
+
 def abrir_e_logar_olos(caminho_csv=None):
+    # Carrega credenciais / URL da OLOS do mesmo TXT do banco
     cfg_raw = {}
     with open(CRED_PATH, "r", encoding="utf-8") as f:
         for line in f:
@@ -659,6 +700,17 @@ def abrir_e_logar_olos(caminho_csv=None):
     usuario = cfg_raw.get("OLOS_USER")
     senha = cfg_raw.get("OLOS_PASS")
 
+    # Fallback se não estiver configurado no TXT
+    if not usuario or not senha:
+        print("[AVISO] OLOS_USER / OLOS_PASS não encontrados no SA_Credencials.txt, usando padrão.")
+        usuario = "lucas.b"
+        senha = "Lucas.25"
+
+    # Debug básico (sem expor a senha)
+    print(f"[DEBUG] OLOS_URL: {url}")
+    print(f"[DEBUG] OLOS_USER: {usuario}")
+    print(f"[DEBUG] OLOS_PASS len: {len(senha) if senha else 0}")
+
     chrome_options = Options()
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_experimental_option("detach", True)
@@ -668,61 +720,72 @@ def abrir_e_logar_olos(caminho_csv=None):
 
     driver.get(url)
 
-    user_input = wait.until(
-        EC.presence_of_element_located(
-            (
-                By.XPATH,
-                "//input[@type='text' or contains(translate(@name,'LOGIN','login'),'login')]",
-            )
-        )
-    )
-    pass_input = wait.until(
-        EC.presence_of_element_located(
-            (
-                By.XPATH,
-                "//input[@type='password' or contains(translate(@name,'SENHA','senha'),'senha')]",
-            )
-        )
-    )
-
-    user_input.clear()
-    user_input.send_keys(usuario)
-    pass_input.clear()
-    pass_input.send_keys(senha)
-
     try:
-        btn = driver.find_element(By.XPATH, "//button[@type='submit']")
-    except Exception:
-        btn = driver.find_element(By.XPATH, "//input[@type='submit']")
-    btn.click()
+        # Localiza campos de usuário/senha de forma mais robusta
+        user_input = _encontrar_campo_usuario(driver, wait)
+        pass_input = _encontrar_campo_senha(driver, wait)
 
-    wait.until(
-        EC.element_to_be_clickable(
-            (By.ID, "ctl00_PageMenu_LinkButtonExternalLink")
-        )
-    ).click()
+        user_input.clear()
+        user_input.send_keys(usuario)
+        pass_input.clear()
+        pass_input.send_keys(senha)
 
+        # Botão de login mais robusto também
+        try:
+            btn = wait.until(
+                EC.element_to_be_clickable((By.XPATH, "//button[@type='submit' or contains(.,'Entrar') or contains(.,'Login')]"))
+            )
+        except TimeoutException:
+            btn = wait.until(
+                EC.element_to_be_clickable((By.XPATH, "//input[@type='submit' or contains(@value,'Entrar') or contains(@value,'Login')]"))
+            )
+
+        driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+        driver.execute_script("arguments[0].click();", btn)
+
+    except Exception as e:
+        print(f"[ERRO] Falha ao preencher login/senha na OLOS: {e}")
+        # Não retorna aqui, porque pode já estar logado ou usar SSO, etc.
+        # Mas normalmente, se der erro aqui, o restante não vai funcionar.
+
+    # A partir daqui mantém o fluxo original
+    # Abrir menu externo
+    try:
+        wait.until(
+            EC.element_to_be_clickable(
+                (By.ID, "ctl00_PageMenu_LinkButtonExternalLink")
+            )
+        ).click()
+    except TimeoutException:
+        print("[ERRO] Não encontrou o botão 'LinkButtonExternalLink' após o login.")
+        return
+
+    # Painel de customizações
     wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//a[contains(., 'Painel de Customizações')]")
         )
     ).click()
 
+    # Trocar para a nova aba
     wait.until(lambda d: len(d.window_handles) > 1)
     driver.switch_to.window(driver.window_handles[-1])
 
+    # Import/Export Web
     wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//span[normalize-space()='Import/Export Web']")
         )
     ).click()
 
+    # ImportFiles
     wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//span[normalize-space()='ImportFiles']")
         )
     ).click()
 
+    # Menu "Importar"
     wait.until(
         EC.element_to_be_clickable(
             (
@@ -733,6 +796,7 @@ def abrir_e_logar_olos(caminho_csv=None):
         )
     ).click()
 
+    # Enviar Mailing
     btn_enviar_mailing = wait.until(
         EC.element_to_be_clickable(
             (By.XPATH, "//span[normalize-space()='Enviar Mailing']")
@@ -741,6 +805,7 @@ def abrir_e_logar_olos(caminho_csv=None):
     driver.execute_script("arguments[0].scrollIntoView(true);", btn_enviar_mailing)
     driver.execute_script("arguments[0].click();", btn_enviar_mailing)
 
+    # Se tiver arquivo CSV, faz upload automático
     if caminho_csv:
         input_upload = wait.until(
             EC.presence_of_element_located((By.ID, "file"))
@@ -845,7 +910,6 @@ class AgendaMailingApp(tk.Tk):
             font=("Segoe UI", 10),
         ).pack(anchor="w", pady=(5, 5))
 
-        # Linha de carteiras
         carteira_frame = ttk.Frame(header)
         carteira_frame.pack(anchor="w", pady=(5, 5))
 
@@ -932,7 +996,10 @@ class AgendaMailingApp(tk.Tk):
             return
 
         if not cod_cli:
-            messagebox.showwarning("Selecione a carteira", "Escolha uma carteira (517, 518 ou 519).")
+            messagebox.showwarning(
+                "Selecione a carteira",
+                "Escolha uma carteira (517, 518 ou 519).",
+            )
             return
 
         sql_template = {
